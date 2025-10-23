@@ -14,50 +14,69 @@ lineWidth = input.int(2, "Line width", minval = 1, maxval = 5)
 barDivOn = input.bool(true, "Show absorption dots above CVD bars")
 dotColorBuy = input.color(#1cc3064d, "Buy absorption dot color (🟢)")
 dotColorSell = input.color(color.new(#ab0404, 0), "Sell absorption dot color (🔴)")
+showDivLabels = input.bool(true, "Show divergence labels")
+bearDivColor = input.color(color.new(color.red, 0), "Bearish divergence label color")
+bullDivColor = input.color(color.new(color.lime, 0), "Bullish divergence label color")
 
 // —— % paklaida pivotų vertinimui
 pivotTolerance = input.float(0.002, "Pivot height tolerance (%)", minval = 0.0, step = 0.001)  // 0.2%
 
 // —— Automatinis lower timeframe
-var lowerTimeframe = switch
+string lowerTimeframe = switch
     useCustomTimeframeInput => lowerTimeframeInput
     timeframe.isseconds => "1S"
     timeframe.isintraday => "1"
     timeframe.isdaily => "5"
     => "60"
 
-// —— LTF CVD duomenys (rankinis kumuliavimas su request.security)
-ltfCvd = request.security(
-     syminfo.tickerid,
-     lowerTimeframe,
-     ta.cum(close > open ? volume : close < open ? -volume : 0),
-     barmerge.gaps_off,
-     barmerge.lookahead_off)
+// —— Anchor laiko serija
+anchorTimeSeries = request.security(
+    syminfo.tickerid,
+    anchorInput,
+    time,
+    barmerge.gaps_off,
+    barmerge.lookahead_off)
 
-// —— HTF delta ir CVD reikšmės
-cvd = ltfCvd
-deltaBar = nz(cvd - cvd[1])
+anchorReset = not na(anchorTimeSeries) and not na(anchorTimeSeries[1]) and anchorTimeSeries != anchorTimeSeries[1]
+
+// —— LTF delta ir kumuliuota CVD
+deltaRaw = request.security(
+    syminfo.tickerid,
+    lowerTimeframe,
+    close > open ? volume : close < open ? -volume : 0,
+    barmerge.gaps_off,
+    barmerge.lookahead_off)
+
+var float cvdSeries = 0.0
+resetBase = anchorReset ? 0.0 : nz(cvdSeries[1])
+cvdSeries := na(deltaRaw) ? resetBase : resetBase + deltaRaw
+cvd = cvdSeries
+openVolume = resetBase
+maxVolume = math.max(openVolume, cvd)
+minVolume = math.min(openVolume, cvd)
+lastVolume = cvd
 
 // —— Absorbcijos logika
 isGreenCandle = close > open
 isRedCandle = close < open
-isRedDelta = deltaBar < 0
-isGreenDelta = deltaBar > 0
+isRedDelta = deltaRaw < 0
+isGreenDelta = deltaRaw > 0
 buyAbsorption = barDivOn and isGreenCandle and isRedDelta
 sellAbsorption = barDivOn and isRedCandle and isGreenDelta
 
 // —— Delta stulpelių spalva
-barColor = deltaBar >= 0 ? #4caf50 : #673ab7
+barColor = deltaRaw >= 0 ? #4caf50 : #673ab7
 
 // —— Piešimas
 hline(0)
-plot(deltaBar, style=plot.style_columns, color=barColor, title="Delta (CVD change)")
-plot(cvd, color=color.new(#00bcd4, 0), title="CVD (cum)")
+plot(deltaRaw, style=plot.style_columns, color=barColor, title="Delta (per bar)")
+plot(cvd, color=color.new(#00bcd4, 0), title="CVD (anchored cum)")
+plotcandle(openVolume, maxVolume, minVolume, lastVolume, title="CVD candle", color=barColor, bordercolor=barColor, wickcolor=barColor)
 
 if buyAbsorption
-    label.new(bar_index, deltaBar, "•", style=label.style_none, textcolor=dotColorBuy, size=size.normal)
+    label.new(bar_index, deltaRaw, "•", style=label.style_none, textcolor=dotColorBuy, size=size.normal)
 if sellAbsorption
-    label.new(bar_index, deltaBar, "•", style=label.style_none, textcolor=dotColorSell, size=size.normal)
+    label.new(bar_index, deltaRaw, "•", style=label.style_none, textcolor=dotColorSell, size=size.normal)
 
 // —— Volume check
 var float cumVol = 0.0
@@ -67,9 +86,10 @@ if barstate.islast and cumVol == 0
 
 // —— Divergencijų nustatymai
 divsOn = input.bool(true, "Draw divergences")
-useDelta = input.string("CVD (last)", "Div source", options = ["CVD (last)", "Delta (last - open)"])
+divSource = input.string("CVD (last)", "Div source", options = ["CVD (last)", "Delta (per bar)"])
 pivotLen = input.int(2, "Pivot left/right", minval = 2)
-osc = useDelta == "Delta (last - open)" ? deltaBar : cvd
+useDeltaSource = divSource == "Delta (per bar)" or divSource == "Delta (last - open)"
+osc = useDeltaSource ? deltaRaw : cvd
 
 // —— Pivot taškai
 phOsc = ta.pivothigh(osc, pivotLen, pivotLen)
@@ -81,12 +101,12 @@ plPrice = ta.pivotlow(close, pivotLen, pivotLen)
 confirmedPhOsc   = phOsc
 confirmedPhPrice = phPrice
 confirmedPhBar   = bar_index - pivotLen
-confirmedPhAnchor = request.security(syminfo.tickerid, anchorInput, time)[pivotLen]
+confirmedPhAnchor = anchorTimeSeries[pivotLen]
 
 confirmedPlOsc   = plOsc
 confirmedPlPrice = plPrice
 confirmedPlBar   = bar_index - pivotLen
-confirmedPlAnchor = request.security(syminfo.tickerid, anchorInput, time)[pivotLen]
+confirmedPlAnchor = anchorTimeSeries[pivotLen]
 
 // —— Atmintis
 var float prevPhOsc = na
@@ -113,7 +133,7 @@ exhaustionTrig := false
 absorptionTrig := false
 
 // —— Divergencijos logika (HIGH)
-if divsOn and not na(confirmedPhOsc) and not na(confirmedPhPrice)
+if divsOn and not na(confirmedPhOsc) and not na(confirmedPhPrice) and not na(confirmedPhAnchor)
     sameAnchorHigh = confirmedPhAnchor == prevPhAnchor
     if not na(prevPhOsc) and sameAnchorHigh
         isBearishRegular = confirmedPhPrice >= prevPhPrice * (1 - pivotTolerance) and confirmedPhOsc < prevPhOsc
@@ -121,16 +141,34 @@ if divsOn and not na(confirmedPhOsc) and not na(confirmedPhPrice)
         if isBearishRegular
             drawExhaustion(prevPhBar, prevPhOsc, confirmedPhBar, confirmedPhOsc)
             exhaustionTrig := true
+            if showDivLabels
+                label.new(
+                    confirmedPhBar,
+                    confirmedPhOsc,
+                    "🔻",
+                    style=label.style_label_down,
+                    color=color.new(bearDivColor, 80),
+                    textcolor=bearDivColor,
+                    size=size.small)
         if isHiddenBearish
             drawAbsorption(prevPhBar, prevPhOsc, confirmedPhBar, confirmedPhOsc)
             absorptionTrig := true
+            if showDivLabels
+                label.new(
+                    confirmedPhBar,
+                    confirmedPhOsc,
+                    "⬇️H",
+                    style=label.style_label_down,
+                    color=color.new(bearDivColor, 80),
+                    textcolor=bearDivColor,
+                    size=size.small)
     prevPhOsc := confirmedPhOsc
     prevPhPrice := confirmedPhPrice
     prevPhBar := confirmedPhBar
     prevPhAnchor := confirmedPhAnchor
 
 // —— Divergencijos logika (LOW)
-if divsOn and not na(confirmedPlOsc) and not na(confirmedPlPrice)
+if divsOn and not na(confirmedPlOsc) and not na(confirmedPlPrice) and not na(confirmedPlAnchor)
     sameAnchorLow = confirmedPlAnchor == prevPlAnchor
     if not na(prevPlOsc) and sameAnchorLow
         isBullishRegular = confirmedPlPrice <= prevPlPrice * (1 + pivotTolerance) and confirmedPlOsc > prevPlOsc
@@ -138,9 +176,27 @@ if divsOn and not na(confirmedPlOsc) and not na(confirmedPlPrice)
         if isBullishRegular
             drawExhaustion(prevPlBar, prevPlOsc, confirmedPlBar, confirmedPlOsc)
             exhaustionTrig := true
+            if showDivLabels
+                label.new(
+                    confirmedPlBar,
+                    confirmedPlOsc,
+                    "🔺",
+                    style=label.style_label_up,
+                    color=color.new(bullDivColor, 80),
+                    textcolor=bullDivColor,
+                    size=size.small)
         if isHiddenBullish
             drawAbsorption(prevPlBar, prevPlOsc, confirmedPlBar, confirmedPlOsc)
             absorptionTrig := true
+            if showDivLabels
+                label.new(
+                    confirmedPlBar,
+                    confirmedPlOsc,
+                    "⬆️H",
+                    style=label.style_label_up,
+                    color=color.new(bullDivColor, 80),
+                    textcolor=bullDivColor,
+                    size=size.small)
     prevPlOsc := confirmedPlOsc
     prevPlPrice := confirmedPlPrice
     prevPlBar := confirmedPlBar
