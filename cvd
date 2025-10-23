@@ -1,0 +1,150 @@
+//@version=6
+indicator("Cumulative Volume Delta + Divergences (Fuzzy Pivots)", "CVD+Div", format=format.volume, max_lines_count=500, max_labels_count=500)
+
+import TradingView/ta/8
+
+// —— Inputs
+anchorInput = input.timeframe("1D", "Anchor period")
+useCustomTimeframeInput = input.bool(false, "Use custom timeframe")
+lowerTimeframeInput = input.timeframe("1", "Timeframe", active = useCustomTimeframeInput)
+
+// —— Vizualiniai
+lineColor = input.color(color.new(#b9bdbd, 0), "Line color")
+lineWidth = input.int(2, "Line width", minval = 1, maxval = 5)
+barDivOn = input.bool(true, "Show absorption dots above CVD bars")
+dotColorBuy = input.color(#1cc3064d, "Buy absorption dot color (🟢)")
+dotColorSell = input.color(color.new(#ab0404, 0), "Sell absorption dot color (🔴)")
+
+// —— % paklaida pivotams
+pivotTolerance = input.float(0.002, "Pivot height tolerance (%)", minval = 0.0, step = 0.001)
+
+// —— Auto lower TF
+var lowerTimeframe = switch
+    useCustomTimeframeInput => lowerTimeframeInput
+    timeframe.isseconds => "1S"
+    timeframe.isintraday => "1"
+    timeframe.isdaily => "5"
+    => "60"
+
+// —— LTF delta ir CVD (tikras skaiciavimas)
+ltfCvd = request.security(syminfo.tickerid, lowerTimeframe,
+     ta.cum(close > open ? volume : close < open ? -volume : 0),
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+// HTF baro “delta” – CVD pokytis tarp dabartinio ir praeito HTF baro
+cvd = ltfCvd
+deltaBar = nz(cvd - cvd[1])
+
+// —— Dots (absorbcija)
+isGreenCandle = close > open
+isRedCandle   = close < open
+isRedDelta    = deltaBar < 0
+isGreenDelta  = deltaBar > 0
+buyAbsorption  = barDivOn and isGreenCandle and isRedDelta
+sellAbsorption = barDivOn and isRedCandle  and isGreenDelta
+
+// —— CVD bar spalva
+barColor = deltaBar >= 0 ? #4caf50 : #673ab7
+
+// —— Piešimas
+hline(0)
+plot(deltaBar, style=plot.style_columns, color=barColor, title="Delta (CVD change)")
+plot(cvd, color=color.new(#00bcd4, 0), title="CVD (cum)")
+
+if buyAbsorption
+    label.new(bar_index, deltaBar, "•", style=label.style_none, textcolor=dotColorBuy, size=size.normal)
+if sellAbsorption
+    label.new(bar_index, deltaBar, "•", style=label.style_none, textcolor=dotColorSell, size=size.normal)
+
+// —— Volume check
+var float cumVol = 0.0
+cumVol += nz(volume)
+if barstate.islast and cumVol == 0
+    runtime.error("The data vendor doesn't provide volume data for this symbol.")
+
+// —— Divergenciju nustatymai
+divsOn = input.bool(true, "Draw divergences")
+useDelta = input.string("CVD (last)", "Div source", options = ["CVD (last)", "Delta (last - open)"])
+pivotLen = input.int(2, "Pivot left/right", minval = 2)
+osc = useDelta == "Delta (last - open)" ? deltaBar : cvd
+
+// —— Pivotai
+phOsc = ta.pivothigh(osc,   pivotLen, pivotLen)
+plOsc = ta.pivotlow(osc,    pivotLen, pivotLen)
+phPrice = ta.pivothigh(close, pivotLen, pivotLen)
+plPrice = ta.pivotlow(close,  pivotLen, pivotLen)
+
+// —— Patvirtinti pivotai (su delay)
+confirmedPhOsc    = phOsc
+confirmedPhPrice  = phPrice
+confirmedPhBar    = bar_index - pivotLen
+confirmedPhAnchor = request.security(syminfo.tickerid, anchorInput, time)[pivotLen]
+
+confirmedPlOsc    = plOsc
+confirmedPlPrice  = plPrice
+confirmedPlBar    = bar_index - pivotLen
+confirmedPlAnchor = request.security(syminfo.tickerid, anchorInput, time)[pivotLen]
+
+// —— Atmintis
+var float prevPhOsc = na
+var float prevPhPrice = na
+var int prevPhBar = na
+var int prevPhAnchor = na
+
+var float prevPlOsc = na
+var float prevPlPrice = na
+var int prevPlBar = na
+var int prevPlAnchor = na
+
+// —— Linijos
+drawAbsorption(fromBar, fromY, toBar, toY) =>
+    line.new(fromBar, fromY, toBar, toY, extend=extend.none, color=lineColor, width=lineWidth, style=line.style_solid)
+
+drawExhaustion(fromBar, fromY, toBar, toY) =>
+    line.new(fromBar, fromY, toBar, toY, extend=extend.none, color=lineColor, width=lineWidth, style=line.style_dashed)
+
+// —— Alert flagai
+var bool exhaustionTrig = false
+var bool absorptionTrig = false
+exhaustionTrig := false
+absorptionTrig := false
+
+// —— Divergencijos (HIGH)
+if divsOn and not na(confirmedPhOsc) and not na(confirmedPhPrice)
+    sameAnchorHigh = confirmedPhAnchor == prevPhAnchor
+    if not na(prevPhOsc) and sameAnchorHigh
+        isBearishRegular = confirmedPhPrice >= prevPhPrice * (1 - pivotTolerance) and confirmedPhOsc < prevPhOsc
+        isHiddenBearish  = confirmedPhPrice <= prevPhPrice * (1 + pivotTolerance) and confirmedPhOsc > prevPhOsc
+        if isBearishRegular
+            drawExhaustion(prevPhBar, prevPhOsc, confirmedPhBar, confirmedPhOsc)
+            exhaustionTrig := true
+        if isHiddenBearish
+            drawAbsorption(prevPhBar, prevPhOsc, confirmedPhBar, confirmedPhOsc)
+            absorptionTrig := true
+    prevPhOsc := confirmedPhOsc
+    prevPhPrice := confirmedPhPrice
+    prevPhBar := confirmedPhBar
+    prevPhAnchor := confirmedPhAnchor
+
+// —— Divergencijos (LOW)
+if divsOn and not na(confirmedPlOsc) and not na(confirmedPlPrice)
+    sameAnchorLow = confirmedPlAnchor == prevPlAnchor
+    if not na(prevPlOsc) and sameAnchorLow
+        isBullishRegular = confirmedPlPrice <= prevPlPrice * (1 + pivotTolerance) and confirmedPlOsc > prevPlOsc
+        isHiddenBullish  = confirmedPlPrice >= prevPlPrice * (1 - pivotTolerance) and confirmedPlOsc < prevPlOsc
+        if isBullishRegular
+            drawExhaustion(prevPlBar, prevPlOsc, confirmedPlBar, confirmedPlOsc)
+            exhaustionTrig := true
+        if isHiddenBullish
+            drawAbsorption(prevPlBar, prevPlOsc, confirmedPlBar, confirmedPlOsc)
+            absorptionTrig := true
+    prevPlOsc := confirmedPlOsc
+    prevPlPrice := confirmedPlPrice
+    prevPlBar := confirmedPlBar
+    prevPlAnchor := confirmedPlAnchor
+
+// —— Alertai
+alertcondition(exhaustionTrig, "Exhaustion", "CVD/Delta: exhaustion (regular divergence)")
+alertcondition(absorptionTrig, "Absorption", "CVD/Delta: absorption (hidden divergence)")
+alertcondition(buyAbsorption, "Buy Absorption", "Green candle but red delta (buy absorption)")
+alertcondition(sellAbsorption, "Sell Absorption", "Red candle but green delta (sell absorption)")
