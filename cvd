@@ -1,150 +1,248 @@
+
 //@version=6
-indicator("Cumulative Volume Delta + Divergences (Fuzzy Pivots)", "CVD+Div", format=format.volume, max_lines_count=500, max_labels_count=500)
+indicator("Insane Crypto Reversal Lab", "ICRL", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
 
-import TradingView/ta/8
+// === Timeframe Inputs ===
+anchorTf = input.timeframe("1D", "Anchor trend timeframe")
+useCustomLowerTf = input.bool(false, "Use custom lower timeframe for volume delta")
+customLowerTf = input.timeframe("5", "Lower timeframe", inline="ltf", tooltip="Intraday timeframe used for lower-timeframe CVD aggregation.")
 
-// —— Inputs
-anchorInput = input.timeframe("1D", "Anchor period")
-useCustomTimeframeInput = input.bool(false, "Use custom timeframe")
-lowerTimeframeInput = input.timeframe("1", "Timeframe", active = useCustomTimeframeInput)
+// === Visual Inputs ===
+regularColor = input.color(color.new(#ff9800, 0), "Regular divergence color")
+hiddenColor = input.color(color.new(#2196f3, 0), "Hidden divergence color")
+confluenceColor = input.color(color.new(#4caf50, 40), "Bullish confluence background")
+confluenceColorBear = input.color(color.new(#f44336, 40), "Bearish confluence background")
+lineWidth = input.int(2, "Divergence line width", minval=1, maxval=5)
+showTable = input.bool(true, "Show confluence dashboard")
 
-// —— Vizualiniai
-lineColor = input.color(color.new(#b9bdbd, 0), "Line color")
-lineWidth = input.int(2, "Line width", minval = 1, maxval = 5)
-barDivOn = input.bool(true, "Show absorption dots above CVD bars")
-dotColorBuy = input.color(#1cc3064d, "Buy absorption dot color (🟢)")
-dotColorSell = input.color(color.new(#ab0404, 0), "Sell absorption dot color (🔴)")
+// === Divergence Settings ===
+pivotLen = input.int(4, "Pivot left/right", minval=2, maxval=20)
+pivotTolerance = input.float(0.004, "Pivot tolerance (%)", minval=0.0, maxval=0.05, step=0.001)
+regularWeight = input.float(1.0, "Regular divergence weight", minval=0.1, step=0.1)
+hiddenWeight = input.float(0.6, "Hidden divergence weight", minval=0.1, step=0.1)
 
-// —— % paklaida pivotams
-pivotTolerance = input.float(0.002, "Pivot height tolerance (%)", minval = 0.0, step = 0.001)
+// === Oscillator Settings ===
+rsiLen = input.int(14, "RSI length")
+rsiSmoothedLen = input.int(5, "RSI smoothing")
+macdFast = input.int(12, "MACD fast")
+macdSlow = input.int(26, "MACD slow")
+macdSignal = input.int(9, "MACD signal")
+cvdSmoothing = input.int(5, "CVD smoothing")
+cmfLen = input.int(20, "CMF length")
 
-// —— Auto lower TF
-var lowerTimeframe = switch
-    useCustomTimeframeInput => lowerTimeframeInput
-    timeframe.isseconds => "1S"
-    timeframe.isintraday => "1"
-    timeframe.isdaily => "5"
-    => "60"
+// === Trend & Risk Filters ===
+trendLen = input.int(55, "Anchor EMA length")
+fastTrendLen = input.int(21, "Micro EMA length")
+atrLen = input.int(14, "ATR length")
+atrMult = input.float(1.6, "ATR extreme multiplier", step=0.1)
+volSpikeMult = input.float(2.2, "Volume spike multiplier", step=0.1)
+clusterThreshold = input.float(2.4, "Confluence trigger score", step=0.1)
 
-// —— LTF delta ir CVD (tikras skaiciavimas)
-ltfCvd = request.security(syminfo.tickerid, lowerTimeframe,
-     ta.cum(close > open ? volume : close < open ? -volume : 0),
-     barmerge.gaps_off, barmerge.lookahead_off)
+// === Helper functions ===
+toPercent(v) => v * 0.01
+floatTolerance = toPercent(pivotTolerance)
 
-// HTF baro “delta” – CVD pokytis tarp dabartinio ir praeito HTF baro
-cvd = ltfCvd
-deltaBar = nz(cvd - cvd[1])
+resolveLowerTf() =>
+    useCustomLowerTf ? customLowerTf :
+         timeframe.isseconds ? "15" :
+         timeframe.isintraday ? "5" :
+         timeframe.isdaily ? "30" :
+         "240"
 
-// —— Dots (absorbcija)
-isGreenCandle = close > open
-isRedCandle   = close < open
-isRedDelta    = deltaBar < 0
-isGreenDelta  = deltaBar > 0
-buyAbsorption  = barDivOn and isGreenCandle and isRedDelta
-sellAbsorption = barDivOn and isRedCandle  and isGreenDelta
+fmtScore(v) => str.tostring(v, format.mintick)
+countTrue(a, b, c, d) => (a ? 1 : 0) + (b ? 1 : 0) + (c ? 1 : 0) + (d ? 1 : 0)
 
-// —— CVD bar spalva
-barColor = deltaBar >= 0 ? #4caf50 : #673ab7
+// === Core series ===
+price = close
+src = ta.hlc3
+lowerTf = resolveLowerTf()
+ltfCvd = request.security(syminfo.tickerid, lowerTf, ta.cum(close > open ? volume : close < open ? -volume : 0), barmerge.gaps_off, barmerge.lookahead_off)
+cvdRaw = ltfCvd
+cvd = ta.ema(cvdRaw, math.max(1, cvdSmoothing))
+deltaBar = ta.change(cvd)
 
-// —— Piešimas
-hline(0)
-plot(deltaBar, style=plot.style_columns, color=barColor, title="Delta (CVD change)")
-plot(cvd, color=color.new(#00bcd4, 0), title="CVD (cum)")
-
-if buyAbsorption
-    label.new(bar_index, deltaBar, "•", style=label.style_none, textcolor=dotColorBuy, size=size.normal)
-if sellAbsorption
-    label.new(bar_index, deltaBar, "•", style=label.style_none, textcolor=dotColorSell, size=size.normal)
-
-// —— Volume check
+// Ensure we have volume data
 var float cumVol = 0.0
 cumVol += nz(volume)
 if barstate.islast and cumVol == 0
     runtime.error("The data vendor doesn't provide volume data for this symbol.")
 
-// —— Divergenciju nustatymai
-divsOn = input.bool(true, "Draw divergences")
-useDelta = input.string("CVD (last)", "Div source", options = ["CVD (last)", "Delta (last - open)"])
-pivotLen = input.int(2, "Pivot left/right", minval = 2)
-osc = useDelta == "Delta (last - open)" ? deltaBar : cvd
+rsiBase = ta.rsi(src, rsiLen)
+rsiSmooth = ta.ema(rsiBase, math.max(1, rsiSmoothedLen)) - 50
+[macdLine, macdSignalLine, macdHist] = ta.macd(src, macdFast, macdSlow, macdSignal)
+macdMomentum = macdHist
+cmf = ta.ema(ta.cmf(high, low, close, volume, cmfLen), 3)
 
-// —— Pivotai
-phOsc = ta.pivothigh(osc,   pivotLen, pivotLen)
-plOsc = ta.pivotlow(osc,    pivotLen, pivotLen)
-phPrice = ta.pivothigh(close, pivotLen, pivotLen)
-plPrice = ta.pivotlow(close,  pivotLen, pivotLen)
+anchorTrend = request.security(syminfo.tickerid, anchorTf, ta.ema(close, trendLen))
+anchorTrendPrev = request.security(syminfo.tickerid, anchorTf, ta.ema(close, trendLen))[1]
+trendSlope = anchorTrend - anchorTrendPrev
+fastEma = ta.ema(close, fastTrendLen)
+trendBiasBull = close > anchorTrend and fastEma > anchorTrend
+trendBiasBear = close < anchorTrend and fastEma < anchorTrend
 
-// —— Patvirtinti pivotai (su delay)
-confirmedPhOsc    = phOsc
-confirmedPhPrice  = phPrice
-confirmedPhBar    = bar_index - pivotLen
-confirmedPhAnchor = request.security(syminfo.tickerid, anchorInput, time)[pivotLen]
+atr = ta.atr(atrLen)
+rangeExtremeBull = low < ta.lowest(low, atrLen)[1] - atr * atrMult
+rangeExtremeBear = high > ta.highest(high, atrLen)[1] + atr * atrMult
+volumeSpike = volume > ta.sma(volume, atrLen) * volSpikeMult
 
-confirmedPlOsc    = plOsc
-confirmedPlPrice  = plPrice
-confirmedPlBar    = bar_index - pivotLen
-confirmedPlAnchor = request.security(syminfo.tickerid, anchorInput, time)[pivotLen]
+// === Divergence engine ===
+f_handle_divergence(_isBullish, _osc, _prevOsc, _prevPrice, _prevBar) =>
+    pivotOsc = _isBullish ? ta.pivotlow(_osc, pivotLen, pivotLen) : ta.pivothigh(_osc, pivotLen, pivotLen)
+    pivotPrice = _isBullish ? ta.pivotlow(price, pivotLen, pivotLen) : ta.pivothigh(price, pivotLen, pivotLen)
+    float prevOscLocal = _prevOsc
+    float prevPriceLocal = _prevPrice
+    int prevBarLocal = _prevBar
+    bool regular = false
+    bool hidden = false
+    if not na(pivotOsc) and not na(pivotPrice)
+        pivotBar = bar_index - pivotLen
+        if not na(prevOscLocal) and not na(prevPriceLocal) and not na(prevBarLocal)
+            if _isBullish
+                regular := pivotPrice <= prevPriceLocal * (1 + floatTolerance) and pivotOsc > prevOscLocal
+                hidden := pivotPrice >= prevPriceLocal * (1 - floatTolerance) and pivotOsc < prevOscLocal
+            else
+                regular := pivotPrice >= prevPriceLocal * (1 - floatTolerance) and pivotOsc < prevOscLocal
+                hidden := pivotPrice <= prevPriceLocal * (1 + floatTolerance) and pivotOsc > prevOscLocal
+            if regular or hidden
+                style = regular ? line.style_solid : line.style_dotted
+                color = regular ? regularColor : hiddenColor
+                line.new(prevBarLocal, prevOscLocal, pivotBar, pivotOsc, extend=extend.none, color=color, width=lineWidth, style=style)
+                labelText = regular ? (_isBullish ? "🐂" : "🐻") : (_isBullish ? "🟢" : "🔴")
+                labelColor = regular ? color.new(color.white, 0) : color.new(color.silver, 0)
+                labelStyle = _isBullish ? label.style_label_down : label.style_label_up
+                label.new(pivotBar, pivotPrice, labelText, style=labelStyle, color=color, textcolor=labelColor, size=size.tiny)
+        prevOscLocal := pivotOsc
+        prevPriceLocal := pivotPrice
+        prevBarLocal := pivotBar
+    [prevOscLocal, prevPriceLocal, prevBarLocal, regular, hidden]
 
-// —— Atmintis
-var float prevPhOsc = na
-var float prevPhPrice = na
-var int prevPhBar = na
-var int prevPhAnchor = na
+// === State for each oscillator
+var float rsiPrevBullOsc = na
+var float rsiPrevBullPrice = na
+var int rsiPrevBullBar = na
+var float rsiPrevBearOsc = na
+var float rsiPrevBearPrice = na
+var int rsiPrevBearBar = na
 
-var float prevPlOsc = na
-var float prevPlPrice = na
-var int prevPlBar = na
-var int prevPlAnchor = na
+var float macdPrevBullOsc = na
+var float macdPrevBullPrice = na
+var int macdPrevBullBar = na
+var float macdPrevBearOsc = na
+var float macdPrevBearPrice = na
+var int macdPrevBearBar = na
 
-// —— Linijos
-drawAbsorption(fromBar, fromY, toBar, toY) =>
-    line.new(fromBar, fromY, toBar, toY, extend=extend.none, color=lineColor, width=lineWidth, style=line.style_solid)
+var float cvdPrevBullOsc = na
+var float cvdPrevBullPrice = na
+var int cvdPrevBullBar = na
+var float cvdPrevBearOsc = na
+var float cvdPrevBearPrice = na
+var int cvdPrevBearBar = na
 
-drawExhaustion(fromBar, fromY, toBar, toY) =>
-    line.new(fromBar, fromY, toBar, toY, extend=extend.none, color=lineColor, width=lineWidth, style=line.style_dashed)
+var float cmfPrevBullOsc = na
+var float cmfPrevBullPrice = na
+var int cmfPrevBullBar = na
+var float cmfPrevBearOsc = na
+var float cmfPrevBearPrice = na
+var int cmfPrevBearBar = na
 
-// —— Alert flagai
-var bool exhaustionTrig = false
-var bool absorptionTrig = false
-exhaustionTrig := false
-absorptionTrig := false
+[rsiPrevBullOsc, rsiPrevBullPrice, rsiPrevBullBar, rsiBullReg, rsiBullHidden] = f_handle_divergence(true, rsiSmooth, rsiPrevBullOsc, rsiPrevBullPrice, rsiPrevBullBar)
+[rsiPrevBearOsc, rsiPrevBearPrice, rsiPrevBearBar, rsiBearReg, rsiBearHidden] = f_handle_divergence(false, rsiSmooth, rsiPrevBearOsc, rsiPrevBearPrice, rsiPrevBearBar)
+[macdPrevBullOsc, macdPrevBullPrice, macdPrevBullBar, macdBullReg, macdBullHidden] = f_handle_divergence(true, macdMomentum, macdPrevBullOsc, macdPrevBullPrice, macdPrevBullBar)
+[macdPrevBearOsc, macdPrevBearPrice, macdPrevBearBar, macdBearReg, macdBearHidden] = f_handle_divergence(false, macdMomentum, macdPrevBearOsc, macdPrevBearPrice, macdPrevBearBar)
+[cvdPrevBullOsc, cvdPrevBullPrice, cvdPrevBullBar, cvdBullReg, cvdBullHidden] = f_handle_divergence(true, deltaBar, cvdPrevBullOsc, cvdPrevBullPrice, cvdPrevBullBar)
+[cvdPrevBearOsc, cvdPrevBearPrice, cvdPrevBearBar, cvdBearReg, cvdBearHidden] = f_handle_divergence(false, deltaBar, cvdPrevBearOsc, cvdPrevBearPrice, cvdPrevBearBar)
+[cmfPrevBullOsc, cmfPrevBullPrice, cmfPrevBullBar, cmfBullReg, cmfBullHidden] = f_handle_divergence(true, cmf, cmfPrevBullOsc, cmfPrevBullPrice, cmfPrevBullBar)
+[cmfPrevBearOsc, cmfPrevBearPrice, cmfPrevBearBar, cmfBearReg, cmfBearHidden] = f_handle_divergence(false, cmf, cmfPrevBearOsc, cmfPrevBearPrice, cmfPrevBearBar)
 
-// —— Divergencijos (HIGH)
-if divsOn and not na(confirmedPhOsc) and not na(confirmedPhPrice)
-    sameAnchorHigh = confirmedPhAnchor == prevPhAnchor
-    if not na(prevPhOsc) and sameAnchorHigh
-        isBearishRegular = confirmedPhPrice >= prevPhPrice * (1 - pivotTolerance) and confirmedPhOsc < prevPhOsc
-        isHiddenBearish  = confirmedPhPrice <= prevPhPrice * (1 + pivotTolerance) and confirmedPhOsc > prevPhOsc
-        if isBearishRegular
-            drawExhaustion(prevPhBar, prevPhOsc, confirmedPhBar, confirmedPhOsc)
-            exhaustionTrig := true
-        if isHiddenBearish
-            drawAbsorption(prevPhBar, prevPhOsc, confirmedPhBar, confirmedPhOsc)
-            absorptionTrig := true
-    prevPhOsc := confirmedPhOsc
-    prevPhPrice := confirmedPhPrice
-    prevPhBar := confirmedPhBar
-    prevPhAnchor := confirmedPhAnchor
+// === Scoring Engine ===
+scoreBull = 0.0
+scoreBear = 0.0
 
-// —— Divergencijos (LOW)
-if divsOn and not na(confirmedPlOsc) and not na(confirmedPlPrice)
-    sameAnchorLow = confirmedPlAnchor == prevPlAnchor
-    if not na(prevPlOsc) and sameAnchorLow
-        isBullishRegular = confirmedPlPrice <= prevPlPrice * (1 + pivotTolerance) and confirmedPlOsc > prevPlOsc
-        isHiddenBullish  = confirmedPlPrice >= prevPlPrice * (1 - pivotTolerance) and confirmedPlOsc < prevPlOsc
-        if isBullishRegular
-            drawExhaustion(prevPlBar, prevPlOsc, confirmedPlBar, confirmedPlOsc)
-            exhaustionTrig := true
-        if isHiddenBullish
-            drawAbsorption(prevPlBar, prevPlOsc, confirmedPlBar, confirmedPlOsc)
-            absorptionTrig := true
-    prevPlOsc := confirmedPlOsc
-    prevPlPrice := confirmedPlPrice
-    prevPlBar := confirmedPlBar
-    prevPlAnchor := confirmedPlAnchor
+f_addScore(cond, weight) => cond ? weight : 0.0
+scoreBull += f_addScore(rsiBullReg, regularWeight)
+scoreBull += f_addScore(rsiBullHidden, hiddenWeight)
+scoreBull += f_addScore(macdBullReg, regularWeight)
+scoreBull += f_addScore(macdBullHidden, hiddenWeight)
+scoreBull += f_addScore(cvdBullReg, regularWeight)
+scoreBull += f_addScore(cvdBullHidden, hiddenWeight)
+scoreBull += f_addScore(cmfBullReg, regularWeight)
+scoreBull += f_addScore(cmfBullHidden, hiddenWeight)
 
-// —— Alertai
-alertcondition(exhaustionTrig, "Exhaustion", "CVD/Delta: exhaustion (regular divergence)")
-alertcondition(absorptionTrig, "Absorption", "CVD/Delta: absorption (hidden divergence)")
-alertcondition(buyAbsorption, "Buy Absorption", "Green candle but red delta (buy absorption)")
-alertcondition(sellAbsorption, "Sell Absorption", "Red candle but green delta (sell absorption)")
+scoreBear += f_addScore(rsiBearReg, regularWeight)
+scoreBear += f_addScore(rsiBearHidden, hiddenWeight)
+scoreBear += f_addScore(macdBearReg, regularWeight)
+scoreBear += f_addScore(macdBearHidden, hiddenWeight)
+scoreBear += f_addScore(cvdBearReg, regularWeight)
+scoreBear += f_addScore(cvdBearHidden, hiddenWeight)
+scoreBear += f_addScore(cmfBearReg, regularWeight)
+scoreBear += f_addScore(cmfBearHidden, hiddenWeight)
+
+// Bonus scoring from environmental context
+scoreBull += f_addScore(volumeSpike and close < open, 0.6)
+scoreBull += f_addScore(rangeExtremeBull, 0.8)
+scoreBull += f_addScore(trendSlope > 0 or trendBiasBull, 0.4)
+scoreBear += f_addScore(volumeSpike and close > open, 0.6)
+scoreBear += f_addScore(rangeExtremeBear, 0.8)
+scoreBear += f_addScore(trendSlope < 0 or trendBiasBear, 0.4)
+
+// === Trigger logic ===
+clusterBull = scoreBull >= clusterThreshold and not trendBiasBear
+clusterBear = scoreBear >= clusterThreshold and not trendBiasBull
+
+bgcolor(clusterBull ? confluenceColor : clusterBear ? confluenceColorBear : na)
+
+plotshape(clusterBull, title="Bullish cluster", style=shape.labelup, text="REV↑", location=location.belowbar, size=size.small, color=color.new(#4caf50, 0), textcolor=color.white)
+plotshape(clusterBear, title="Bearish cluster", style=shape.labeldown, text="REV↓", location=location.abovebar, size=size.small, color=color.new(#f44336, 0), textcolor=color.white)
+
+plot(scoreBull, title="Bull score", color=color.new(#4caf50, 0), linewidth=2, display=display.data_window)
+plot(scoreBear, title="Bear score", color=color.new(#f44336, 0), linewidth=2, display=display.data_window)
+plot(deltaBar, title="CVD delta", color=color.new(#03a9f4, 0), display=display.data_window)
+plot(rsiSmooth, title="RSI (smoothed)", color=color.new(#9c27b0, 0), display=display.data_window)
+plot(macdMomentum, title="MACD momentum", color=color.new(#ffc107, 0), display=display.data_window)
+plot(cmf, title="Chaikin MF", color=color.new(#8bc34a, 0), display=display.data_window)
+hline(0, "Zero", color=color.new(color.gray, 60))
+
+// === Table dashboard ===
+var table dash = table.new(position.top_right, 4, 7, border_width=1)
+if showTable and barstate.islast
+    table.clear(dash)
+    table.cell(dash, 0, 0, "Metric", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 0, "Bull", text_color=color.white, bgcolor=color.new(#2e7d32, 0))
+    table.cell(dash, 2, 0, "Bear", text_color=color.white, bgcolor=color.new(#c62828, 0))
+    table.cell(dash, 3, 0, "Info", text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    bullRegCount = countTrue(rsiBullReg, macdBullReg, cvdBullReg, cmfBullReg)
+    bearRegCount = countTrue(rsiBearReg, macdBearReg, cvdBearReg, cmfBearReg)
+    table.cell(dash, 0, 1, "Regular div", text_color=color.white)
+    table.cell(dash, 1, 1, str.tostring(bullRegCount), text_color=color.white, bgcolor=bullRegCount > 0 ? color.new(#4caf50, 70) : na)
+    table.cell(dash, 2, 1, str.tostring(bearRegCount), text_color=color.white, bgcolor=bearRegCount > 0 ? color.new(#f44336, 70) : na)
+    table.cell(dash, 3, 1, "max 4", text_color=color.white)
+
+    bullHiddenCount = countTrue(rsiBullHidden, macdBullHidden, cvdBullHidden, cmfBullHidden)
+    bearHiddenCount = countTrue(rsiBearHidden, macdBearHidden, cvdBearHidden, cmfBearHidden)
+    table.cell(dash, 0, 2, "Hidden div", text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(bullHiddenCount), text_color=color.white, bgcolor=bullHiddenCount > 0 ? color.new(#4caf50, 70) : na)
+    table.cell(dash, 2, 2, str.tostring(bearHiddenCount), text_color=color.white, bgcolor=bearHiddenCount > 0 ? color.new(#f44336, 70) : na)
+    table.cell(dash, 3, 2, "max 4", text_color=color.white)
+
+    table.cell(dash, 0, 3, "Trend", text_color=color.white)
+    table.cell(dash, 1, 3, trendBiasBull ? "↑" : "-", text_color=color.white, bgcolor=trendBiasBull ? color.new(#4caf50, 60) : na)
+    table.cell(dash, 2, 3, trendBiasBear ? "↓" : "-", text_color=color.white, bgcolor=trendBiasBear ? color.new(#f44336, 60) : na)
+    table.cell(dash, 3, 3, trendSlope > 0 ? "Up" : trendSlope < 0 ? "Down" : "Flat", text_color=color.white)
+
+    table.cell(dash, 0, 4, "ATR extreme", text_color=color.white)
+    table.cell(dash, 1, 4, rangeExtremeBull ? "Yes" : "No", text_color=color.white, bgcolor=rangeExtremeBull ? color.new(#4caf50, 60) : na)
+    table.cell(dash, 2, 4, rangeExtremeBear ? "Yes" : "No", text_color=color.white, bgcolor=rangeExtremeBear ? color.new(#f44336, 60) : na)
+    table.cell(dash, 3, 4, fmtScore(atr), text_color=color.white)
+
+    table.cell(dash, 0, 5, "Volume spike", text_color=color.white)
+    table.cell(dash, 1, 5, volumeSpike ? "Yes" : "No", text_color=color.white, bgcolor=volumeSpike ? color.new(#4caf50, 40) : na)
+    table.cell(dash, 2, 5, volumeSpike ? "Yes" : "No", text_color=color.white, bgcolor=volumeSpike ? color.new(#f44336, 40) : na)
+    table.cell(dash, 3, 5, fmtScore(volume), text_color=color.white)
+
+    table.cell(dash, 0, 6, "Score", text_color=color.white)
+    table.cell(dash, 1, 6, fmtScore(scoreBull), text_color=color.white, bgcolor=clusterBull ? color.new(#4caf50, 60) : na)
+    table.cell(dash, 2, 6, fmtScore(scoreBear), text_color=color.white, bgcolor=clusterBear ? color.new(#f44336, 60) : na)
+    table.cell(dash, 3, 6, "Thresh " + fmtScore(clusterThreshold), text_color=color.white)
+else if not showTable and barstate.islast
+    table.clear(dash)
